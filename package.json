@@ -1,0 +1,20 @@
+{
+  "name": "phisharmor-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Secure PhishArmor proxy for message analysis",
+  "main": "check_sms.js",
+  "scripts": {
+    "start": "node check_sms.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.2.1"
+  },
+  "overrides": {
+    "qs": "^6.16.0"
+  }
+}
