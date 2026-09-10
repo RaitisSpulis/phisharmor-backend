@@ -12,6 +12,11 @@ const yellowSafety = {
   en: 'This message may be legitimate, but for your safety verify it on the official website or in the app!',
   ru: 'Сообщение может быть настоящим, но для безопасности проверьте его на официальном сайте или в приложении!',
 };
+const spamSafety = {
+  lv: 'Globāls mārketinga vai finanšu spams. Ziņa nav tiešs hakeru uzbrukums, taču esiet uzmanīgi.',
+  en: 'Global marketing or financial spam. This is not a direct hacking attack, but remain cautious.',
+  ru: 'Глобальный маркетинговый или финансовый спам. Это не прямая хакерская атака, но соблюдайте осторожность.',
+};
 const statusTemplates = {
   lv: {
     red: 'Kritisks risks! [Uzņēmuma nosaukums] krāpniecība. Nespiediet uz saites un neievadiet datus.',
@@ -83,20 +88,23 @@ async function analyzeMessage(text, lang) {
       body: JSON.stringify({
         model: 'gpt-4o-mini',
         temperature: 0,
-        max_tokens: 180,
+        max_tokens: 220,
         response_format: { type: 'json_object' },
         messages: [
           {
             role: 'system',
             content: [
-              'Tu esi PhishArmor globāls kiberdrošības MI eksperts.',
-              'Analizē jebkuras pasaules valsts un valodas SMS, ekrānuzņēmuma OCR tekstu vai tālruņa numuru.',
-              'Atpazīsti viltus kurjerus un pakas, Amazon, FedEx, DHL, PayPal, Revolut, Netflix, starptautiskas bankas un agresīvu kredītu/spama reklāmu shēmas.',
+              'Tu esi PhishArmor Starptautiskais Kiberdrošības Izmeklēšanas Eksperts.',
+              'Analizē jebkuras pasaules valsts un valodas SMS, ekrānuzņēmuma OCR tekstu vai tālruņa numuru; nepārvērtē risku tikai valodas, valsts vai uzņēmuma nezināmības dēļ.',
+              'Solis A — GLOBĀLĀ SAITES UN DOMĒNA ANATOMIJA: atrodi katru URL. Ja tas izliekas par Amazon, FedEx, DHL, PayPal, Revolut, Netflix, Airbnb, starptautisku banku vai vietēju iestādi, bet domēns nav oficiālais, piešķir SARKANS. Arī negaidīts bit.ly, tinyurl, linktr.ee vai līdzīgs saīsinātājs finanšu ziņā ir SARKANS, ja tas slēpj iespējamu izlikšanos vai datu ievadi.',
+              'Solis B — GLOBĀLĀ PSIHOLOĢISKĀ MANIPULĀCIJA: meklē steidzināšanu, konta bloķēšanas draudus, viltus autorizāciju, paroles/kartes datu pieprasījumu, negaidītus paku nodokļus vai laimestus. Jebkurā valodā šādas pazīmes nozīmē SARKANS.',
+              `Solis C — STARPTAUTISKAIS SPAMS UN FINANŠU REKLĀMA: agresīvs mārketings, investīciju shēmas, ātra peļņa ar MI, kriptovalūtu “pamācības” vai agresīvi kredīti (piemēram, “0% interest loan up to $5000”) nozīmē DZELTENS, nevis SARKANS. Skaidrojumā dabiski iekļauj: ${spamSafety[lang]}`,
+              'NEPOPULĀRA AVOTA PRINCIPS: mazs kurjers vai mazpazīstams starptautisks avots bez spiediena, krāpniecības pazīmēm un viltus saitēm var būt ZAĻŠ vai DZELTENS. Pasaki, ka saturs ir strukturāli drošs vai tikai nepārbaudāms; nebiedē lietotāju bez pamata.',
               `Atbildi tikai ${languageNames[lang]} valodā un tikai tīrā JSON formātā bez Markdown: {"status":"SARKANS|DZELTENS|ZAĻŠ","reason":"..."}.`,
-              'reason ir maksimāli 1–2 īsi, dabiski teikumi; neiekļauj analīzes procesu vai liekus paskaidrojumus.',
-              `SARKANS 🔴: tieša krāpniecība, steidzināšana, viltus saite vai datu izkrāpšana. Izmanto šo struktūru: ${statusTemplates[lang].red}`,
-              `DZELTENS 🟡: aizdomīgs saturs, agresīva reklāma vai reāla banka/iestāde, ko nevar 100% pārbaudīt. Izmanto šo struktūru: ${statusTemplates[lang].yellow} Obligāti pievieno tieši šo drošības teikumu: ${yellowSafety[lang]}`,
-              `ZAĻŠ 🟢: pilnīgi droša ikdienas ziņa. Izmanto šo struktūru: ${statusTemplates[lang].green}`,
+              'reason drīkst būt maksimāli 1–2 īsi, asi un dabiski teikumi; neiekļauj analīzes procesu, URL sarakstus vai liekus paskaidrojumus.',
+              `SARKANS 🔴: izmanto īsu, tiešu brīdinājumu pēc šīs struktūras: ${statusTemplates[lang].red}`,
+              `DZELTENS 🟡: izmanto īsu brīdinājumu pēc šīs struktūras: ${statusTemplates[lang].yellow} Bankas vai iestādes gadījumā obligāti pievieno: ${yellowSafety[lang]}`,
+              `ZAĻŠ 🟢: izmanto īsu apstiprinājumu pēc šīs struktūras: ${statusTemplates[lang].green}`,
               'Ja uzņēmuma nosaukums nav zināms, sarkanajā šablonā [Uzņēmuma nosaukums] aizstāj ar “nezināms avots”.',
             ].join('\n'),
           },
