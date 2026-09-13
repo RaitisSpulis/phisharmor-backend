@@ -15,6 +15,7 @@ const allowedOrigins = new Set(
 const clientApiKey = process.env.PHISHARMOR_API_KEY?.trim() || '';
 const mobileClientName = 'phisharmor-android';
 const allowedRiskLevels = new Set(['RED', 'YELLOW', 'GREEN']);
+const allowedEvidenceLevels = new Set(['confirmed_direct', 'suspicious_or_unverified', 'no_risk_found']);
 const allowedScamTypes = new Set([
   'phishing_url', 'impersonation', 'urgency_extortion', 'investment_scam',
   'delivery_fake', 'marketing_spam', 'safe',
@@ -26,6 +27,7 @@ const analysisSchema = {
   additionalProperties: false,
   properties: {
     risk_level: { type: 'string', enum: ['RED', 'YELLOW', 'GREEN'] },
+    evidence_level: { type: 'string', enum: ['confirmed_direct', 'suspicious_or_unverified', 'no_risk_found'] },
     scam_type: { type: 'string', enum: [
       'phishing_url', 'impersonation', 'urgency_extortion', 'investment_scam',
       'delivery_fake', 'marketing_spam', 'safe',
@@ -38,7 +40,7 @@ const analysisSchema = {
     user_alert_message: { type: 'string', minLength: 1, maxLength: 360 },
   },
   required: [
-    'risk_level', 'scam_type', 'confidence_score', 'detected_language',
+    'risk_level', 'evidence_level', 'scam_type', 'confidence_score', 'detected_language',
     'danger_factors', 'user_alert_message',
   ],
 };
@@ -183,12 +185,15 @@ function buildSystemPrompt(language, inputType) {
     'You are the PhishArmor global cybersecurity engine.',
     'You MUST use web_search_preview before final classification. Do not return final JSON until live web search has executed using the supplied queries.',
     'Search globally across multiple languages and reliable complaint, fraud-report, telecom, domain, and official brand sources. Never expose personal data from search results.',
-    'If any credible public report says the number is used for scams, robocalls, fake investments, or impersonation of a bank or courier, use RED. One credible complaint is enough, but never invent evidence.',
-    'If a URL impersonates a known brand and differs from its official domain by even one meaningful character, use RED. Treat lookalike domains, punycode, shortened URLs, and suspicious redirects as high risk.',
-    'Use YELLOW when evidence is insufficient or ambiguous. Use GREEN only when live search and content show no meaningful risk indicators. Unknown country, language, or format alone is never proof of fraud.',
+    'Risk policy is strict and conservative to prevent false alarms:',
+    'RED is allowed ONLY when there is direct, conclusive, independently verifiable evidence of an actual scam attack. Examples include a URL that is an unmistakable brand impersonation and does not match the official domain, or a phone number directly identified as fraudulent by a reliable public registry or official source.',
+    'A single vague complaint, a search result saying possible scam, an unfamiliar number, an international number, urgency, unusual wording, a request for money or codes, a shortened URL, a suspicious redirect, or a lookalike that is not conclusively verified is NOT enough for RED.',
+    'When evidence is incomplete, ambiguous, unverified, or can only be described as possible fraud, potential spam, suspicious activity, or likely scam, you MUST use risk_level YELLOW and evidence_level suspicious_or_unverified.',
+    'Use GREEN only when the content or contact is ordinary and no meaningful risk indicators are present after the required search. Do not infer safety merely because no search result was found.',
+    'For RED, evidence_level MUST be confirmed_direct. For YELLOW, evidence_level MUST be suspicious_or_unverified. For GREEN, evidence_level MUST be no_risk_found. Never claim 100% certainty from weak or indirect evidence.',
     `Analyze ${inputType === 'phone_number' ? 'the phone number and its public reputation' : 'the message, OCR content, phone numbers, URLs, and brand claims'} for a global audience.`,
     `Write danger_factors and user_alert_message in ${languageNames[language]}. detected_language must describe the original input language.`,
-    'Return only the required Structured Outputs object with risk_level, scam_type, confidence_score, detected_language, danger_factors, and user_alert_message.',
+    'Return only the required Structured Outputs object with risk_level, evidence_level, scam_type, confidence_score, detected_language, danger_factors, and user_alert_message.',
   ].join('\n');
 }
 
@@ -223,8 +228,13 @@ function extractPhoneNumber(value) {
 
 function extractResponseText(payload) {
   if (typeof payload?.output_text === 'string') return payload.output_text;
-  const message = payload?.output?.find((item) => item?.type === 'message');
-  return message?.content?.find((item) => item?.type === 'output_text')?.text;
+  if (!Array.isArray(payload?.output)) return undefined;
+  for (const item of payload.output) {
+    if (!Array.isArray(item?.content)) continue;
+    const textPart = item.content.find((part) => part?.type === 'output_text');
+    if (typeof textPart?.text === 'string') return textPart.text;
+  }
+  return undefined;
 }
 
 function validateText(value) {
@@ -247,8 +257,10 @@ function validateInputType(value) {
 }
 
 function validateResult(value) {
+  const evidenceLevel = value?.evidence_level;
   if (
     !value || typeof value !== 'object' || !allowedRiskLevels.has(value.risk_level) ||
+    !allowedEvidenceLevels.has(evidenceLevel) ||
     !allowedScamTypes.has(value.scam_type) || typeof value.confidence_score !== 'number' ||
     !Number.isFinite(value.confidence_score) || value.confidence_score < 0 || value.confidence_score > 1 ||
     typeof value.detected_language !== 'string' || !value.detected_language.trim() ||
@@ -256,8 +268,13 @@ function validateResult(value) {
     value.danger_factors.some((factor) => typeof factor !== 'string' || !factor.trim()) ||
     typeof value.user_alert_message !== 'string' || !value.user_alert_message.trim()
   ) throw new Error('OpenAI response did not match the expected schema');
+  const riskLevel = evidenceLevel === 'confirmed_direct' && value.risk_level === 'RED'
+    ? 'RED'
+    : evidenceLevel === 'no_risk_found' && value.risk_level === 'GREEN'
+    ? 'GREEN'
+    : 'YELLOW';
   return {
-    risk_level: value.risk_level, scam_type: value.scam_type, confidence_score: value.confidence_score,
+    risk_level: riskLevel, evidence_level: evidenceLevel, scam_type: value.scam_type, confidence_score: value.confidence_score,
     detected_language: value.detected_language.trim().slice(0, 80),
     danger_factors: value.danger_factors.map((factor) => factor.trim().slice(0, 240)),
     user_alert_message: value.user_alert_message.trim().slice(0, 360),
