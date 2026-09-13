@@ -13,6 +13,7 @@ const allowedOrigins = new Set(
   (process.env.ALLOWED_ORIGINS || '').split(',').map((origin) => origin.trim()).filter(Boolean),
 );
 const clientApiKey = process.env.PHISHARMOR_API_KEY?.trim() || '';
+const mobileClientName = 'phisharmor-android';
 const allowedRiskLevels = new Set(['RED', 'YELLOW', 'GREEN']);
 const allowedScamTypes = new Set([
   'phishing_url', 'impersonation', 'urgency_extortion', 'investment_scam',
@@ -71,7 +72,7 @@ app.use(cors({
     if (!origin || allowedOrigins.has(origin)) return callback(null, true);
     return callback(new Error('CORS origin denied'));
   },
-  allowedHeaders: ['Content-Type', 'X-PhishArmor-Key'],
+  allowedHeaders: ['Content-Type', 'X-PhishArmor-Key', 'X-PhishArmor-App'],
   methods: ['GET', 'POST', 'OPTIONS'],
 }));
 app.use(express.json({ limit: '32kb' }));
@@ -117,6 +118,7 @@ function isAuthorizedRequest(request) {
     const actual = Buffer.from(providedKey);
     if (expected.length === actual.length && crypto.timingSafeEqual(expected, actual)) return true;
   }
+  if (!clientApiKey && request.get('X-PhishArmor-App') === mobileClientName) return true;
   return Boolean(request.get('Origin') && allowedOrigins.has(request.get('Origin')));
 }
 
