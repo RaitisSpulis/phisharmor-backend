@@ -7,21 +7,34 @@ const app = express();
 const port = Number(process.env.PORT) || 3000;
 const upstreamTimeoutMs = 25_000;
 const maxTextLength = 10_000;
-const maxImageDataLength = 12_000_000;
+const maxImageBytes = 2 * 1024 * 1024;
+const maxImageBase64Length = Math.ceil(maxImageBytes / 3) * 4 + 16;
+const manualLimit = 5;
+const manualWindowMs = 60 * 60 * 1000;
+const premiumLimit = 30;
+const premiumWindowMs = 24 * 60 * 60 * 1000;
 const allowedLanguages = new Set(['lv', 'en', 'ru']);
 const allowedInputTypes = new Set(['message', 'phone_number', 'call_transcript']);
+const allowedImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp']);
+const verifiedDomains = new Set([
+  'primero.lv', 'go.primero.lv', 'swedbank.lv', 'omniva.lv', 'dpd.lv', 'latvija.gov.lv',
+]);
 const allowedOrigins = new Set(
   (process.env.ALLOWED_ORIGINS || '').split(',').map((origin) => origin.trim()).filter(Boolean),
 );
 const clientApiKey = process.env.PHISHARMOR_API_KEY?.trim() || '';
 const mobileClientName = 'phisharmor-android';
-const allowedRiskLevels = new Set(['RED', 'YELLOW', 'GREEN']);
-const allowedEvidenceLevels = new Set(['confirmed_direct', 'suspicious_or_unverified', 'no_risk_found']);
-const allowedScamTypes = new Set([
-  'phishing_url', 'impersonation', 'urgency_extortion', 'investment_scam',
-  'delivery_fake', 'marketing_spam', 'safe',
-]);
 const languageNames = { lv: 'latviešu', en: 'angļu', ru: 'krievu' };
+const limitMessages = {
+  lv: 'Pārsniegts pieprasījumu limits. Lūdzu, mēģiniet vēlreiz vēlāk, lai aizsargātu sistēmas resursus.',
+  en: 'The request limit was exceeded. Please try again later to protect system resources.',
+  ru: 'Лимит запросов превышен. Повторите попытку позже для защиты системных ресурсов.',
+};
+const errorMessages = {
+  lv: 'Drošības pārbaudi neizdevās pabeigt. Lūdzu, mēģiniet vēlreiz un neklikšķiniet uz saitēm, kamēr ziņa nav pārbaudīta.',
+  en: 'The security check could not be completed. Please try again and do not click links until the message is checked.',
+  ru: 'Не удалось завершить проверку безопасности. Повторите попытку и не нажимайте на ссылки, пока сообщение не проверено.',
+};
 
 const analysisSchema = {
   type: 'object',
@@ -42,19 +55,13 @@ const analysisSchema = {
   ],
 };
 
-const errorMessages = {
-  lv: 'Drošības pārbaudi neizdevās pabeigt. Lūdzu, mēģiniet vēlreiz un neklikšķiniet uz saitēm, kamēr ziņa nav pārbaudīta.',
-  en: 'The security check could not be completed. Please try again and do not click links until the message is checked.',
-  ru: 'Не удалось завершить проверку безопасности. Повторите попытку и не нажимайте на ссылки, пока сообщение не проверено.',
-};
-
 const regionalSearchProfiles = [
   { prefixes: ['371'], region: 'Latvia', terms: ['scam', 'kas zvanīja', 'krāpnieki'] },
   { prefixes: ['370'], region: 'Lithuania', terms: ['scam', 'kas skambino', 'sukčiai'] },
   { prefixes: ['372'], region: 'Estonia', terms: ['scam', 'kes helistas', 'pettus'] },
   { prefixes: ['44'], region: 'United Kingdom', terms: ['who called me', 'scam lookup', 'fraud report'] },
   { prefixes: ['1'], region: 'United States or Canada', terms: ['scam report', 'who called', 'spam call'] },
-  { prefixes: ['33'], region: 'France', terms: ['numéro arnaque', 'qui m\'a appelé', 'appel spam'] },
+  { prefixes: ['33'], region: 'France', terms: ['numéro arnaque', "qui m'a appelé", 'appel spam'] },
   { prefixes: ['49'], region: 'Germany', terms: ['Betrugsnummer', 'wer hat angerufen', 'Spam Anruf'] },
   { prefixes: ['34'], region: 'Spain', terms: ['número estafa', 'quién me llamó', 'llamada spam'] },
   { prefixes: ['39'], region: 'Italy', terms: ['numero truffa', 'chi mi ha chiamato', 'chiamata spam'] },
@@ -64,6 +71,8 @@ const regionalSearchProfiles = [
   { prefixes: ['7'], region: 'Russia or Kazakhstan', terms: ['номер мошенники', 'кто звонил', 'спам звонок'] },
 ];
 
+const requestBuckets = new Map();
+
 app.disable('x-powered-by');
 app.use(helmet());
 app.use(cors({
@@ -71,10 +80,10 @@ app.use(cors({
     if (!origin || allowedOrigins.has(origin)) return callback(null, true);
     return callback(new Error('CORS origin denied'));
   },
-  allowedHeaders: ['Content-Type', 'X-PhishArmor-Key', 'X-PhishArmor-App'],
+  allowedHeaders: ['Content-Type', 'X-PhishArmor-Key', 'X-PhishArmor-App', 'X-PhishArmor-Mode'],
   methods: ['GET', 'POST', 'OPTIONS'],
 }));
-app.use(express.json({ limit: '32kb' }));
+app.use(express.json({ limit: '4mb' }));
 
 if (!clientApiKey && allowedOrigins.size === 0) {
   console.error('No ALLOWED_ORIGINS or PHISHARMOR_API_KEY configured; all analysis requests will be denied.');
@@ -87,13 +96,25 @@ app.post(['/','/check-sms'], async (request, response, next) => {
     if (!isAuthorizedRequest(request)) {
       return response.status(403).json(neutralResult('en', 'Request not authorized'));
     }
-    const image = validateImage(request.body?.image_base64 ?? request.body?.image_data, request.body?.image_mime_type);
+
+    const language = requestLanguage(request);
+    const premiumBackground = isPremiumBackgroundRequest(request);
+    if (!consumeRateLimit(request.ip, premiumBackground)) {
+      return response.status(429).json(rateLimitResult(language));
+    }
+
+    const image = validateImage(
+      request.body?.image_base64 ?? request.body?.image_data,
+      request.body?.image_mime_type,
+    );
     const rawText = request.body?.text ?? request.body?.input_text;
     const text = rawText == null || rawText === ''
       ? 'No extracted text. Analyze the attached image.'
       : validateText(rawText);
-    const language = validateLanguage(request.body?.language ?? request.body?.lang);
     const inputType = validateInputType(request.body?.input_type);
+
+    const localResult = classifyVerifiedDomain(text, language);
+    if (localResult) return response.json(localResult);
     if (!process.env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is not configured');
     return response.json(await analyzeMessage(text, language, inputType, image));
   } catch (error) {
@@ -104,15 +125,21 @@ app.post(['/','/check-sms'], async (request, response, next) => {
 app.use((_request, response) => response.status(404).json(neutralResult('en', 'Endpoint not found')));
 
 app.use((error, request, response, _next) => {
-  const statusCode = error?.type === 'entity.parse.failed'
+  const statusCode = error?.type === 'entity.too.large' || error?.type === 'entity.parse.failed'
     ? 400
     : Number.isInteger(error?.statusCode) ? error.statusCode : 502;
-  const requestedLanguage = request.body?.language ?? request.body?.lang;
-  const language = allowedLanguages.has(requestedLanguage) ? requestedLanguage : 'en';
-  const publicMessage = statusCode === 400 ? 'Request body must be valid JSON.' : errorMessages[language];
+  const language = requestLanguage(request);
+  const publicMessage = statusCode === 400
+    ? 'Request body must be valid JSON and contain an image no larger than 2 MB.'
+    : errorMessages[language];
   console.error('Request failed:', error?.message || 'Unknown server error');
   response.status(statusCode).json(neutralResult(language, publicMessage));
 });
+
+function requestLanguage(request) {
+  const value = request.body?.language ?? request.body?.lang;
+  return allowedLanguages.has(value) ? value : 'en';
+}
 
 function isAuthorizedRequest(request) {
   const providedKey = request.get('X-PhishArmor-Key') || '';
@@ -125,6 +152,36 @@ function isAuthorizedRequest(request) {
   return Boolean(request.get('Origin') && allowedOrigins.has(request.get('Origin')));
 }
 
+function isPremiumBackgroundRequest(request) {
+  return request.body?.is_background === true || request.body?.background === true ||
+    request.body?.scope === 'background' || request.get('X-PhishArmor-Mode') === 'premium-background';
+}
+
+function consumeRateLimit(ip, premiumBackground, now = Date.now()) {
+  const limit = premiumBackground ? premiumLimit : manualLimit;
+  const windowMs = premiumBackground ? premiumWindowMs : manualWindowMs;
+  const key = `${premiumBackground ? 'premium' : 'manual'}:${ip || 'unknown'}`;
+  const current = requestBuckets.get(key);
+  const timestamps = (current || []).filter((timestamp) => now - timestamp < windowMs);
+  if (timestamps.length >= limit) {
+    requestBuckets.set(key, timestamps);
+    return false;
+  }
+  timestamps.push(now);
+  requestBuckets.set(key, timestamps);
+  if (requestBuckets.size > 10_000) pruneRateLimits(now);
+  return true;
+}
+
+function pruneRateLimits(now) {
+  for (const [key, timestamps] of requestBuckets) {
+    const windowMs = key.startsWith('premium:') ? premiumWindowMs : manualWindowMs;
+    const active = timestamps.filter((timestamp) => now - timestamp < windowMs);
+    if (active.length === 0) requestBuckets.delete(key);
+    else requestBuckets.set(key, active);
+  }
+}
+
 function neutralResult(language, message) {
   return {
     risk_level: 'YELLOW', scam_type: 'safe', confidence_score: 0, detected_language: 'unknown',
@@ -132,12 +189,64 @@ function neutralResult(language, message) {
   };
 }
 
+function rateLimitResult(language) {
+  const message = limitMessages[language] || limitMessages.en;
+  return {
+    ...neutralResult(language, message),
+    error: 'rate_limit_exceeded',
+    danger_factors: [message],
+    user_alert_message: message,
+  };
+}
+
+function classifyVerifiedDomain(text, language) {
+  const domains = extractDomains(text);
+  const verified = domains.some((domain) => verifiedDomains.has(domain));
+  if (!verified || hasCredentialTheftSignals(text)) return null;
+  const marketing = /(?:reklām|akcij|piedāv|atlaide|kredīt|mogo|primero|newsletter|promo|sale)/i.test(text);
+  const riskLevel = marketing ? 'YELLOW' : 'GREEN';
+  const message = marketing
+    ? localized(language, 'marketing')
+    : localized(language, 'verified');
+  return {
+    risk_level: riskLevel,
+    scam_type: marketing ? 'marketing_spam' : 'safe',
+    confidence_score: marketing ? 0.4 : 0.05,
+    detected_language: language,
+    danger_factors: marketing ? ['Neprasīts mārketinga ziņojums no verificēta domēna.'] : [],
+    user_alert_message: message,
+  };
+}
+
+function extractDomains(text) {
+  const domains = [];
+  const pattern = /(?:https?:\/\/|www\.)?([a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+)/gi;
+  for (const match of String(text).matchAll(pattern)) domains.push(match[1].toLowerCase().replace(/\.$/, ''));
+  return domains;
+}
+
+function hasCredentialTheftSignals(text) {
+  return /(?:smart[ -]?id|pin\s*[12]|pin2|internetbank|internet bank|bankas parole|parole|verification code|verifikācijas kod)/i.test(text) &&
+    /(?:ievad|nosūt|nosūtiet|apstiprin|atklāj|share|enter|confirm|send|код|введите|подтверд)/i.test(text);
+}
+
+function localized(language, kind) {
+  if (kind === 'marketing') {
+    if (language === 'en') return 'An official marketing message, but verify the link before taking action.';
+    if (language === 'ru') return 'Официальное маркетинговое сообщение, но проверьте ссылку перед действием.';
+    return 'Oficiāls mārketinga ziņojums, tomēr pirms darbības pārbaudiet saites adresi.';
+  }
+  if (language === 'en') return 'A verified domain was found and no Smart-ID PIN2 or password theft indicators were detected.';
+  if (language === 'ru') return 'Обнаружен проверенный домен, признаков кражи Smart-ID PIN2 или пароля нет.';
+  return 'Verificēts domēns un nav atrastas Smart-ID PIN2 vai paroles izkrāpšanas pazīmes.';
+}
+
 async function analyzeMessage(text, language, inputType, image) {
   const searchPlan = buildSearchPlan(text, inputType);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), upstreamTimeoutMs);
   try {
-    const upstreamResponse = await fetch('https://api.openai.com/v1/responses', {
+    const upstreamResponse = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -145,44 +254,34 @@ async function analyzeMessage(text, language, inputType, image) {
       },
       body: JSON.stringify({
         model: process.env.PHISHARMOR_OPENAI_MODEL || 'gpt-4o-mini',
-        tools: [{ type: 'web_search_preview' }],
-        tool_choice: 'required',
-        max_output_tokens: 700,
-        text: { format: {
-          type: 'json_schema', name: 'phisharmor_security_analysis', strict: true, schema: analysisSchema,
-        } },
-        input: [
-          {
-            role: 'system',
-            content: [{ type: 'input_text', text: buildSystemPrompt(language, inputType) }],
-          },
-          {
-            role: 'user',
-            content: [
-              { type: 'input_text', text: [
-                `Input type: ${inputType}`,
-                `Normalized phone number: ${searchPlan.normalizedNumber || 'not applicable'}`,
-                `Detected region: ${searchPlan.region}`,
-                'Mandatory search queries:',
-                ...searchPlan.queries.map((query) => `- ${query}`),
-                `Content to analyze:\n${text}`,
-              ].join('\n') },
-              ...(image ? [{
-                type: 'input_image',
-                image_url: image.dataUrl,
-                detail: 'high',
-              }] : []),
-            ],
-          },
+        temperature: 0,
+        max_tokens: 700,
+        response_format: {
+          type: 'json_schema',
+          json_schema: { name: 'phisharmor_security_analysis', strict: true, schema: analysisSchema },
+        },
+        messages: [
+          { role: 'system', content: buildSystemPrompt(language, inputType) },
+          { role: 'user', content: [
+            { type: 'text', text: [
+              `Input type: ${inputType}`,
+              `Normalized phone number: ${searchPlan.normalizedNumber || 'not applicable'}`,
+              `Detected region: ${searchPlan.region}`,
+              'Regional reputation search queries to consider:',
+              ...searchPlan.queries.map((query) => `- ${query}`),
+              `Content to analyze:\n${text}`,
+            ].join('\n') },
+            ...(image ? [{ type: 'image_url', image_url: { url: image.dataUrl, detail: 'low' } }] : []),
+          ] },
         ],
       }),
       signal: controller.signal,
     });
     if (!upstreamResponse.ok) throw new Error(`OpenAI request failed with status ${upstreamResponse.status}`);
     const payload = await upstreamResponse.json();
-    const content = extractResponseText(payload);
+    const content = payload?.choices?.[0]?.message?.content;
     if (typeof content !== 'string') throw new Error('OpenAI response has an invalid shape');
-    return validateResult(JSON.parse(content));
+    return validateResult(JSON.parse(content), language);
   } finally {
     clearTimeout(timeout);
   }
@@ -190,16 +289,14 @@ async function analyzeMessage(text, language, inputType, image) {
 
 function buildSystemPrompt(language, inputType) {
   return [
-    'You are PhishArmor Core, a cybersecurity classification engine.',
-    'Perform a private step-by-step security evaluation internally, but never reveal chain-of-thought or hidden reasoning. Return only the required JSON object.',
-    'Use web_search_preview before classification. Search reliable official, domain, telecom, fraud-report, and complaint sources in relevant languages. Never expose personal data.',
-    'RED-equivalent output is allowed only for direct, strong, independently verifiable evidence of a phishing attack or confirmed fraud.',
-    'Urgency, unusual wording, an unfamiliar or international number, requests for money or codes, possible spam, a vague complaint, a shortened URL, or an unverified lookalike are not conclusive proof. Treat these as suspicious and use a moderate score with MONITOR.',
-    'Use risk_score from 0.00 to 1.00. Use BLOCK_AND_ALERT only for a clearly confirmed attack. Use MONITOR for suspicious or unverified activity. Use ALLOW only when no meaningful risk indicators are found.',
-    'is_phishing MUST be true exactly when risk_score is at least 0.50, otherwise it MUST be false.',
-    `Analyze ${inputType === 'phone_number' ? 'the phone number and its public reputation' : 'the message, OCR content, image text, phone numbers, URLs, and brand claims'} for a global audience.`,
-    `Write technical_analysis and user_alert_message_lv in ${languageNames[language]}.`,
-    'Return exactly these fields in this order: scam_indicators_found, technical_analysis, risk_score, is_phishing, action_required, user_alert_message_lv.',
+    'You are PhishArmor Core, a professional cybersecurity classification engine.',
+    'Reason privately and do not reveal chain-of-thought, hidden reasoning, or internal deliberations. Return only the required JSON object with concise evidence-based conclusions.',
+    'Assess the message, OCR content, image text, phone numbers, URLs, and brand claims. Use the supplied regional search queries as investigation leads, but never invent search results or claim verification that was not provided.',
+    'RED is reserved for direct, strong, independently verifiable evidence of phishing or confirmed fraud. Unfamiliar numbers, urgency, requests for money or codes, shortened URLs, and unverified complaints are suspicious but not conclusive; use MONITOR and a moderate score.',
+    'All unsolicited marketing messages and SMS advertisements from official non-bank lenders such as Primero or Mogo must be YELLOW, never RED, when they do not request Smart-ID PIN2 codes or bank passwords.',
+    'Use risk_score from 0.00 to 1.00. Set is_phishing true exactly when risk_score is at least 0.50. Use BLOCK_AND_ALERT only for a clearly confirmed attack, MONITOR for suspicious or unverified activity, and ALLOW only when no meaningful risk indicators exist.',
+    `Analyze ${inputType === 'phone_number' ? 'the phone number and its public reputation' : 'the message and any attached image'} for a global audience. Write technical_analysis and user_alert_message_lv in ${languageNames[language]}.`,
+    'Return exactly the six schema fields. Keep technical_analysis short, professional, and evidence-based.',
   ].join('\n');
 }
 
@@ -232,26 +329,10 @@ function extractPhoneNumber(value) {
   return match ? normalizePhoneNumber(match[0]) : '';
 }
 
-function extractResponseText(payload) {
-  if (typeof payload?.output_text === 'string') return payload.output_text;
-  if (!Array.isArray(payload?.output)) return undefined;
-  for (const item of payload.output) {
-    if (!Array.isArray(item?.content)) continue;
-    const textPart = item.content.find((part) => part?.type === 'output_text');
-    if (typeof textPart?.text === 'string') return textPart.text;
-  }
-  return undefined;
-}
-
 function validateText(value) {
   if (typeof value !== 'string' || !value.trim()) throw badRequest('"text" must be a non-empty string');
   if (value.length > maxTextLength) throw badRequest(`"text" must be at most ${maxTextLength} characters`);
   return value.trim();
-}
-
-function validateLanguage(value) {
-  if (typeof value !== 'string' || !allowedLanguages.has(value)) throw badRequest('"language" must be one of: lv, en, ru');
-  return value;
 }
 
 function validateInputType(value) {
@@ -264,20 +345,22 @@ function validateInputType(value) {
 
 function validateImage(value, mimeType = 'image/jpeg') {
   if (value == null || value === '') return null;
-  if (typeof value !== 'string' || value.length > maxImageDataLength) {
-    throw badRequest('"image_base64" must be a base64 image smaller than 12 MB');
+  if (typeof value !== 'string' || value.length > maxImageBase64Length) {
+    throw badRequest('"image_base64" must contain an image no larger than 2 MB');
   }
-  if (!['image/jpeg', 'image/png', 'image/webp'].includes(mimeType)) {
+  if (!allowedImageTypes.has(mimeType)) {
     throw badRequest('"image_mime_type" must be image/jpeg, image/png, or image/webp');
   }
   const base64 = value.replace(/^data:image\/(jpeg|png|webp);base64,/i, '');
-  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64) || base64.length < 16) {
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64) || base64.length < 16 || base64.length % 4 === 1) {
     throw badRequest('"image_base64" must contain valid base64 image data');
   }
+  const byteLength = Buffer.byteLength(base64, 'base64');
+  if (byteLength > maxImageBytes) throw badRequest('"image_base64" must contain an image no larger than 2 MB');
   return { dataUrl: `data:${mimeType};base64,${base64}` };
 }
 
-function validateResult(value) {
+function validateResult(value, language) {
   if (
     !value || typeof value !== 'object' || !Array.isArray(value.scam_indicators_found) ||
     value.scam_indicators_found.length > 12 ||
@@ -294,15 +377,13 @@ function validateResult(value) {
     : value.risk_score >= 0.35 || value.action_required === 'MONITOR'
     ? 'YELLOW'
     : 'GREEN';
-  const scamType = inferScamType(value.scam_indicators_found, riskLevel);
+  const indicators = value.scam_indicators_found.map((factor) => factor.trim().slice(0, 240));
   return {
     risk_level: riskLevel,
-    scam_type: scamType,
+    scam_type: inferScamType(indicators, riskLevel),
     confidence_score: value.risk_score,
-    detected_language: 'lv',
-    danger_factors: (value.scam_indicators_found.length > 0
-      ? value.scam_indicators_found
-      : [value.technical_analysis]).map((factor) => factor.trim().slice(0, 240)),
+    detected_language: language,
+    danger_factors: indicators.length > 0 ? indicators : [value.technical_analysis.trim().slice(0, 240)],
     user_alert_message: value.user_alert_message_lv.trim().slice(0, 360),
   };
 }
